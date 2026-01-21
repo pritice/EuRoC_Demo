@@ -1,0 +1,33 @@
+{
+  "frames_total": 200,
+  "grid_size_hw": [
+    120,
+    139
+  ],
+  "bounds_xy_m": {
+    "xmin": -7.548745,
+    "xmax": 6.2959309999999995,
+    "ymin": -4.720481,
+    "ymax": 7.1977709999999995
+  },
+  "res_m": 0.1,
+  "z_floor_ref_m": 2.40429425239563,
+  "valid_ratio": 0.9988009592326139,
+  "unknown_ratio": 0.31798561151079136,
+  "free_ratio": 0.18183453237410072,
+  "occupied_ratio": 0.500179856115108,
+  "occupied_infl_ratio": 0.6796163069544364,
+  "total_pts_in_bounds": 3163506,
+  "total_cells_updated": 62526,
+  "pix_step": 3,
+  "depth_range_m": [
+    0.1,
+    12.0
+  ],
+  "traversable_names": [
+    "floor",
+    "road"
+  ],
+  "step_height_thr_m": 0.25,
+  "inflate_radius_m": 0.3
+}

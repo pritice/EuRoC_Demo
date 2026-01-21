@@ -1,0 +1,4 @@
+{
+  "processed_frames": 200,
+  "note": "如果 labeled_pts 普遍很小，说明 Step3 的语义 mask 太稀疏；先保证几何累计可视化，再改进分割密度。"
+}

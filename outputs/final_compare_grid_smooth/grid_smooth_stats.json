@@ -1,0 +1,23 @@
+{
+  "raw": {
+    "isolated_cell_ratio": 0.2356115107913669,
+    "component_count_total": 117
+  },
+  "pixel_clean": {
+    "isolated_cell_ratio": 0.24280575539568344,
+    "component_count_total": 120
+  },
+  "grid_smooth": {
+    "isolated_cell_ratio": 0.13309352517985612,
+    "component_count_total": 61
+  },
+  "params": {
+    "iters": 8,
+    "w_self": 2,
+    "allow_fill_unknown": false,
+    "preserve_ids": [
+      1,
+      11
+    ]
+  }
+}

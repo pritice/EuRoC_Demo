@@ -1,0 +1,19 @@
+{
+  "t_ns": 1413393925705760512,
+  "fuse_k": 160,
+  "local_size_m": 24.0,
+  "N": 24,
+  "pix_step": 3,
+  "raw": {
+    "pts_used": 2641212,
+    "isolated_cell_ratio": 0.2356115107913669,
+    "component_count_total": 117,
+    "small_component_cells_ratio": 0.19964028776978418
+  },
+  "clean": {
+    "pts_used": 2641212,
+    "isolated_cell_ratio": 0.24280575539568344,
+    "component_count_total": 120,
+    "small_component_cells_ratio": 0.2068345323741007
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "classes": [
+    "wall",
+    "door",
+    "window",
+    "table",
+    "chair",
+    "sofa",
+    "bed",
+    "cabinet",
+    "box",
+    "person",
+    "floor"
+  ],
+  "class_to_id": {
+    "wall": 1,
+    "door": 2,
+    "window": 3,
+    "table": 4,
+    "chair": 5,
+    "sofa": 6,
+    "bed": 7,
+    "cabinet": 8,
+    "box": 9,
+    "person": 10,
+    "floor": 11
+  },
+  "dino": {
+    "box_thresh": 0.3,
+    "text_thresh": 0.25,
+    "nms_iou": 0.55,
+    "max_dets": 40,
+    "caption": "wall . door . window . table . chair . sofa . bed . cabinet . box . person . floor ."
+  },
+  "sam2": {
+    "cfg_name": "configs/sam2.1/sam2.1_hiera_l.yaml",
+    "cfg_abs": "/root/autodl-tmp/sam-3d-objects/third_party/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml",
+    "ckpt_abs": "/root/autodl-tmp/sam-3d-objects/third_party/sam2/checkpoints/sam2.1_hiera_large.pt"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "processed_frames": 200,
+  "mask_rectified_used": true,
+  "note": "若后期topdown过快“满图”，可设置 --keep_recent 80 或启用 --zrel_min/--zrel_max 限制高度。"
+}

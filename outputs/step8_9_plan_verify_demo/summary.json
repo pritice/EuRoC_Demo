@@ -1,0 +1,8 @@
+{
+  "state_path": "/root/autodl-tmp/sam-3d-objects/EuRoC/stmr_demo/outputs/step7_global_states_v4_N60/states/state_1413393925705760512.json",
+  "t_ns": 1413393925705760512,
+  "best_iter": 0,
+  "best_ok": true,
+  "best_score": 108.0,
+  "note": "LLM modules are stubbed; replace parse_instruction_stub and llm_revision_suggester_stub with real LLM calls."
+}

@@ -1,0 +1,1 @@
+{"iter": 0, "ok": true, "cand_cost": 108.0, "base_cost": 108.0, "inflate_cells": 0, "avoid_names": [], "reports": {"collision": {"pass": true}, "constraints": {"pass": true}, "completion": {"pass": true, "end": [30, 58], "goal": [30, 58], "chebyshev_dist": 0, "radius_cells": 0}, "efficiency": {"pass": true, "ratio": 1.0, "thr": 1.2, "cand": 108.0, "base": 108.0}}}

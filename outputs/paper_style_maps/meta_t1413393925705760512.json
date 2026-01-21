@@ -1,0 +1,12 @@
+{
+  "t_ns": 1413393925705760512,
+  "local_size_m": 24.0,
+  "N": 24,
+  "cell_m": 1.0,
+  "fine_cell_m": 0.2,
+  "fuse_k": 160,
+  "ego_align": true,
+  "yaw0_rad": 2.4064949977096424,
+  "z_floor_ref": 3.254880428314209,
+  "pts_used": 2641212
+}

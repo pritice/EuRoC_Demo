@@ -1,0 +1,9 @@
+{
+  "mav0": "/root/autodl-tmp/sam-3d-objects/inputs/mav0",
+  "cam0_frames": 2348,
+  "cam1_frames": 2348,
+  "common": 2348,
+  "kept": 2309,
+  "dropped_by_dt": 39,
+  "max_dt_ns": 2000000
+}

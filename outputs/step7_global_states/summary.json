@@ -1,0 +1,17 @@
+{
+  "processed_frames": 200,
+  "global": {
+    "GW": 139,
+    "GH": 120,
+    "res_m": 0.1,
+    "xmin": -7.548745,
+    "ymin": -4.720481,
+    "xmax": 6.2959309999999995,
+    "ymax": 7.1977709999999995
+  },
+  "dirs": {
+    "states": "/root/autodl-tmp/sam-3d-objects/EuRoC/stmr_demo/outputs/step7_global_states/states",
+    "global_map": "/root/autodl-tmp/sam-3d-objects/EuRoC/stmr_demo/outputs/step7_global_states/global_map"
+  },
+  "note": "This is a baseline costmap; traversability will be overridden by LLM later."
+}

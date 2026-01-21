@@ -1,0 +1,7 @@
+{
+  "target_n": 200,
+  "picked": 200,
+  "min_trans_m": 0.2,
+  "min_yaw_deg": 8.0,
+  "fallback_stride": 5
+}
