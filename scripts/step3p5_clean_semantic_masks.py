@@ -71,15 +71,38 @@ def majority_filter_3x3(lbl):
             out[y,x] = int(bc.argmax())
     return out
 
+def drop_tiny_islands(mask, tiny_island_px, *,
+                      protect_long_thin=True,
+                      long_min_len_px=25,
+                      long_max_thick_px=6):
+    if tiny_island_px <= 0:
+        return mask
+    out = mask.copy()
+    ids = [int(x) for x in np.unique(out) if int(x) != 0]
+    for cid in ids:
+        binm = (out == cid).astype(np.uint8)
+        ncc, cc = cv2.connectedComponents(binm, connectivity=4)
+        for k in range(1, ncc):
+            comp = (cc == k).astype(np.uint8)
+            area = int(comp.sum())
+            if area <= 0 or area >= tiny_island_px:
+                continue
+            if protect_long_thin and is_long_thin(comp, long_min_len_px, long_max_thick_px):
+                continue
+            out[comp > 0] = 0
+    return out
+
 def clean_mask(mask, *,
                small_area_px=350,
                ring_r=3,
                ring_min_cnt=30,
                min_keep_area_px=80,
+               small_area_mode="unknown",
                protect_long_thin=True,
                long_min_len_px=25,
                long_max_thick_px=6,
-               do_majority_filter=True):
+               do_majority_filter=True,
+               tiny_island_px=30):
     """
     核心：小碎片并入邻域主类；细长结构保护；最后多数滤波。
     """
@@ -101,21 +124,36 @@ def clean_mask(mask, *,
             if protect_long_thin and is_long_thin(comp, long_min_len_px, long_max_thick_px):
                 continue
 
-            # 小碎片：并入邻域主类（不删除）
+            # 小碎片：并入邻域主类，否则按模式处理
             if area < small_area_px:
                 lab, cnt = majority_label_in_ring(out, comp, ring_r=ring_r, ignore_ids=(0, cid))
-                if (lab is not None) and (cnt >= ring_min_cnt):
-                    out[comp > 0] = np.uint8(lab)
+                if small_area_mode == "merge":
+                    if (lab is not None) and (cnt >= ring_min_cnt):
+                        out[comp > 0] = np.uint8(lab)
+                    elif area <= min_keep_area_px:
+                        protect_mask |= (comp > 0)
+                elif small_area_mode == "unknown":
+                    if (lab is not None) and (cnt >= ring_min_cnt):
+                        out[comp > 0] = np.uint8(lab)
+                    else:
+                        out[comp > 0] = 0
                 else:
                     if area <= min_keep_area_px:
                         protect_mask |= (comp > 0)
-                # 如果找不到邻域主类：保持原类（不删除），以满足“不想删室内常见物体”的要求
 
     # 最后一轮轻量多数滤波，清掉盐椒噪点
     if do_majority_filter:
         out = majority_filter_3x3(out.astype(np.uint8))
         if np.any(protect_mask):
             out[protect_mask] = mask[protect_mask]
+
+    out = drop_tiny_islands(
+        out,
+        int(tiny_island_px),
+        protect_long_thin=protect_long_thin,
+        long_min_len_px=long_min_len_px,
+        long_max_thick_px=long_max_thick_px,
+    )
 
     return out
 
@@ -129,9 +167,13 @@ def main():
     ap.add_argument("--ring_r", type=int, default=3)
     ap.add_argument("--ring_min_cnt", type=int, default=30)
     ap.add_argument("--min_keep_area_px", type=int, default=80)
+    ap.add_argument("--small_area_mode", type=str, default="unknown", choices=["merge", "unknown", "keep"],
+                    help="how to handle small components when no strong neighbor")
     ap.add_argument("--protect_long_thin", action="store_true")
     ap.add_argument("--long_min_len_px", type=int, default=25)
     ap.add_argument("--long_max_thick_px", type=int, default=6)
+    ap.add_argument("--tiny_island_px", type=int, default=30,
+                    help="remove tiny islands after smoothing (0 to disable)")
     ap.add_argument("--no_majority_filter", action="store_true")
     args = ap.parse_args()
 
@@ -150,10 +192,12 @@ def main():
             ring_r=args.ring_r,
             ring_min_cnt=args.ring_min_cnt,
             min_keep_area_px=args.min_keep_area_px,
+            small_area_mode=args.small_area_mode,
             protect_long_thin=bool(args.protect_long_thin),
             long_min_len_px=args.long_min_len_px,
             long_max_thick_px=args.long_max_thick_px,
             do_majority_filter=(not args.no_majority_filter),
+            tiny_island_px=args.tiny_island_px,
         )
         op = os.path.join(args.out_dir, f)
         cv2.imwrite(op, mc)

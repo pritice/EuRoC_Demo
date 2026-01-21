@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, json, math, argparse
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import numpy as np
 import cv2
@@ -161,6 +161,101 @@ def grid_majority_smooth(semN: np.ndarray,
     return sem.astype(np.uint8)
 
 
+def height_source_metrics(h_mask: np.ndarray) -> Dict[str, float]:
+    total = int(h_mask.size)
+    valid_cells = int(h_mask.sum())
+    ratio = float(valid_cells / max(total, 1))
+    return {"valid_cells": int(valid_cells), "ratio": float(ratio)}
+
+
+def remove_small_components_sem(sem: np.ndarray, min_cells: int, preserve_ids=None) -> Tuple[np.ndarray, int]:
+    if min_cells <= 1:
+        return sem, 0
+    if preserve_ids is None:
+        preserve_ids = set()
+    out = sem.copy().astype(np.uint8)
+    removed = 0
+    ids = [int(x) for x in np.unique(out) if int(x) > 0]
+    for cid in ids:
+        if cid in preserve_ids:
+            continue
+        m = (out == cid).astype(np.uint8)
+        ncc, lab = cv2.connectedComponents(m, connectivity=4)
+        for k in range(1, ncc):
+            comp = (lab == k)
+            area = int(comp.sum())
+            if area < min_cells:
+                out[comp] = 0
+                removed += area
+    return out, removed
+
+
+def compute_align_angle(sem: np.ndarray, min_known_cells: int) -> Optional[float]:
+    ys, xs = np.where(sem > 0)
+    if xs.size < min_known_cells:
+        return None
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    rect = cv2.minAreaRect(pts)
+    box = cv2.boxPoints(rect)
+    edges = box[np.arange(4)] - box[(np.arange(4) + 1) % 4]
+    lens = np.sum(edges * edges, axis=1)
+    i = int(np.argmax(lens))
+    dx, dy = edges[i]
+    ang = float(np.degrees(np.arctan2(dy, dx)))
+    return ang
+
+
+def align_and_square_region(sem: np.ndarray,
+                            min_known_cells: int,
+                            pad_cells: int) -> Tuple[np.ndarray, np.ndarray, int, int, int, float]:
+    H, W = sem.shape
+    angle = compute_align_angle(sem, min_known_cells)
+    if angle is None:
+        M = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        return sem, M, 0, 0, W, 0.0
+    center = (W / 2.0, H / 2.0)
+    M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+    sem_rot = cv2.warpAffine(sem, M, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+    ys, xs = np.where(sem_rot > 0)
+    if xs.size == 0:
+        return sem_rot, M, 0, 0, W, angle
+    x0 = int(xs.min()) - int(pad_cells)
+    x1 = int(xs.max()) + 1 + int(pad_cells)
+    y0 = int(ys.min()) - int(pad_cells)
+    y1 = int(ys.max()) + 1 + int(pad_cells)
+    side = int(max(x1 - x0, y1 - y0))
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    x0 = int(np.floor(cx - side / 2.0))
+    y0 = int(np.floor(cy - side / 2.0))
+    return sem_rot, M, x0, y0, side, angle
+
+
+def square_mask_from_xy(sem_shape: Tuple[int, int], x0: int, y0: int, side: int) -> np.ndarray:
+    H, W = sem_shape
+    mask = np.zeros((H, W), dtype=bool)
+    x1 = x0 + side
+    y1 = y0 + side
+    sx0 = max(0, x0)
+    sy0 = max(0, y0)
+    sx1 = min(W, x1)
+    sy1 = min(H, y1)
+    if sx1 > sx0 and sy1 > sy0:
+        mask[sy0:sy1, sx0:sx1] = True
+    return mask
+
+
+def resize_with_nan(h: np.ndarray, out_size: int) -> np.ndarray:
+    h = h.astype(np.float32)
+    valid = np.isfinite(h).astype(np.uint8)
+    h2 = h.copy()
+    h2[~np.isfinite(h2)] = 0.0
+    h_res = cv2.resize(h2, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+    m_res = cv2.resize(valid, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+    h_res[m_res == 0] = np.nan
+    return h_res
+
+
 # -----------------------------
 # RANSAC ground plane: z = a*x + b*y + c
 # -----------------------------
@@ -260,7 +355,7 @@ def extract_objects_from_grid(semN: np.ndarray, hrelN: np.ndarray,
             cy = float(ys.mean()); cx = float(xs.mean())
             hh = hrelN[ys, xs]
             hh = hh[np.isfinite(hh)]
-            h_m = float(np.percentile(hh, 95)) if hh.size > 0 else float("nan")
+            h_m = float(np.percentile(hh, 95)) if hh.size > 0 else None
             objs.append({
                 "class_id": int(cid),
                 "class_name": id_to_name.get(cid, f"id{cid}"),
@@ -270,7 +365,14 @@ def extract_objects_from_grid(semN: np.ndarray, hrelN: np.ndarray,
                 "size_m_LW": [l_m, w_m],
                 "height_m": h_m,
             })
-    objs.sort(key=lambda x: (-x["area_cells"], -(0 if not np.isfinite(x["height_m"]) else x["height_m"])))
+    def sort_key(o):
+        h = o.get("height_m", None)
+        if isinstance(h, (int, float)) and np.isfinite(h):
+            hv = float(h)
+        else:
+            hv = -1e9
+        return (-int(o["area_cells"]), -hv)
+    objs.sort(key=sort_key)
     return objs[:max_objects]
 
 def default_cost_from_sem(semN: np.ndarray, id_to_name: Dict[int,str]) -> np.ndarray:
@@ -313,6 +415,8 @@ def main():
     ap.add_argument("--ego_align", action="store_true")
     ap.add_argument("--smooth_iters", type=int, default=6)
     ap.add_argument("--smooth_w_self", type=int, default=3)
+    ap.add_argument("--sem_min_component_cells", type=int, default=4,
+                    help="remove small semantic islands after smoothing")
     ap.add_argument("--max_objects", type=int, default=30)
     ap.add_argument("--min_area_cells", type=int, default=2)
 
@@ -323,6 +427,18 @@ def main():
     ap.add_argument("--ransac_thresh", type=float, default=0.10)
     ap.add_argument("--ransac_min_inliers", type=int, default=40)
     ap.add_argument("--ransac_seed", type=int, default=0)
+    ap.add_argument("--height_select_min_ratio", type=float, default=0.005)
+    ap.add_argument("--height_select_min_cells", type=int, default=20)
+    ap.add_argument("--export_square_states", action="store_true",
+                    help="write square-aligned states for planning without overwriting originals")
+    ap.add_argument("--square_states_dir", default="",
+                    help="output dir for square states (default: out_dir/states_square)")
+    ap.add_argument("--square_min_known_cells", type=int, default=60)
+    ap.add_argument("--square_pad_cells", type=int, default=2)
+    ap.add_argument("--no_square_fill_unknown_floor", action="store_true",
+                    help="disable filling unknown inside square with floor label")
+    ap.add_argument("--square_force_N", type=int, default=0,
+                    help="force square state grid size (0 to keep original N)")
 
     args = ap.parse_args()
 
@@ -379,6 +495,12 @@ def main():
 
     index_path = os.path.join(args.out_dir, "state_index.jsonl")
     idx_f = open(index_path, "w")
+    out_states_square = ""
+    idx_sq_f = None
+    if args.export_square_states:
+        out_states_square = args.square_states_dir or os.path.join(args.out_dir, "states_square")
+        ensure_dir(out_states_square)
+        idx_sq_f = open(os.path.join(out_states_square, "state_index.jsonl"), "w")
 
     processed = 0
     N = int(args.N)
@@ -526,6 +648,11 @@ def main():
             w_self=int(args.smooth_w_self),
             allow_fill_unknown=False,  # IMPORTANT: keep unknown as unknown
         )
+        semS, sem_removed = remove_small_components_sem(
+            semS,
+            min_cells=int(args.sem_min_component_cells),
+            preserve_ids=preserve_ids,
+        )
 
         # -------- height estimation --------
         cell_m = float(args.local_size_m) / float(N)
@@ -571,18 +698,36 @@ def main():
         h_ransac_valid = np.isfinite(h_ransac)
 
         # choose height
+        floor_metrics = height_source_metrics(h_floor_valid)
+        ransac_metrics = height_source_metrics(h_ransac_valid)
+        ransac_metrics["model_ok"] = bool(abc is not None)
+
+        candidates = []
+        candidates.append(("floorref", h_floor, h_floor_valid, floor_metrics))
+        if abc is not None:
+            candidates.append(("ransac", h_ransac, h_ransac_valid, ransac_metrics))
+
+        mode_used = "floorref"
+        fallback_used = False
         if args.ground_mode == "floorref":
             h_use = h_floor; h_use_valid = h_floor_valid; mode_used = "floorref"
         elif args.ground_mode == "ransac":
-            if abc is not None:
+            if abc is not None and ransac_metrics["valid_cells"] > 0:
                 h_use = h_ransac; h_use_valid = h_ransac_valid; mode_used = "ransac"
             else:
                 h_use = h_floor; h_use_valid = h_floor_valid; mode_used = "floorref_fallback"
+                fallback_used = True
         else:
-            if abc is not None:
-                h_use = h_ransac; h_use_valid = h_ransac_valid; mode_used = "ransac"
+            min_ratio = float(args.height_select_min_ratio)
+            min_cells = int(args.height_select_min_cells)
+            usable = [c for c in candidates if (c[3]["ratio"] >= min_ratio and c[3]["valid_cells"] >= min_cells)]
+            if usable:
+                usable.sort(key=lambda x: (x[3]["ratio"], x[3]["valid_cells"]), reverse=True)
+                mode_used, h_use, h_use_valid, _ = usable[0]
             else:
-                h_use = h_floor; h_use_valid = h_floor_valid; mode_used = "floorref"
+                candidates.sort(key=lambda x: (x[3]["ratio"], x[3]["valid_cells"]), reverse=True)
+                mode_used, h_use, h_use_valid, _ = candidates[0]
+                fallback_used = True
 
         # objects
         objs = extract_objects_from_grid(
@@ -608,6 +753,7 @@ def main():
             "pose": {
                 "p_WB": [float(x) for x in r["p_WB"]],
                 "yaw_rad": float(yaw),
+                "yaw_source": "body",
             },
             "map": {
                 "N": int(N),
@@ -633,6 +779,16 @@ def main():
                 "ransac_plane_z_axbyc": [float(x) for x in abc] if abc is not None else None,
                 "ransac_stats": rstats,   # ALWAYS exists
             },
+            "height_select": {
+                "mode_used": mode_used,
+                "fallback_used": bool(fallback_used),
+                "min_ratio": float(args.height_select_min_ratio),
+                "min_cells": int(args.height_select_min_cells),
+                "candidates": {
+                    "floorref": floor_metrics,
+                    "ransac": ransac_metrics,
+                },
+            },
 
             "objects": objs,
             "cost_grid_default": cost.tolist(),
@@ -641,15 +797,127 @@ def main():
                 "valid_height_ratio": float(h_use_valid.mean()),
                 "valid_height_ratio_floorref": float(h_floor_valid.mean()),
                 "valid_height_ratio_ransac": float(h_ransac_valid.mean()),
+                "valid_height_cells": int(h_use_valid.sum()),
+                "valid_height_cells_floorref": int(h_floor_valid.sum()),
+                "valid_height_cells_ransac": int(h_ransac_valid.sum()),
+                "sem_removed_small_cells": int(sem_removed),
             }
         }
 
         sp = os.path.join(out_states, f"state_{t}.json")
         write_json(sp, state)
         idx_f.write(json.dumps({"t_ns": t, "state_path": sp}, ensure_ascii=False) + "\n")
+
+        if args.export_square_states and idx_sq_f is not None:
+            sem_rot, M_sq, sx0, sy0, side, ang = align_and_square_region(
+                semS,
+                min_known_cells=int(args.square_min_known_cells),
+                pad_cells=int(args.square_pad_cells),
+            )
+            square_mask = square_mask_from_xy(sem_rot.shape, sx0, sy0, side)
+            sem_sq = np.zeros_like(sem_rot, dtype=np.uint8)
+            sem_sq[square_mask] = sem_rot[square_mask]
+            fill_unknown_floor = not bool(args.no_square_fill_unknown_floor)
+            if fill_unknown_floor and floor_id > 0:
+                sem_sq = sem_sq.copy()
+                sem_sq[square_mask] = int(floor_id)
+                keep = square_mask & (sem_rot > 0)
+                sem_sq[keep] = sem_rot[keep]
+
+            def warp_h(h, fill_value):
+                hw = cv2.warpAffine(h, M_sq, (N, N), flags=cv2.INTER_NEAREST, borderValue=fill_value)
+                out = hw.copy().astype(np.float32)
+                if np.isfinite(fill_value):
+                    out[~square_mask] = float(fill_value)
+                else:
+                    out[~square_mask] = np.nan
+                return out
+
+            def warp_m(m):
+                mw = cv2.warpAffine(m.astype(np.uint8), M_sq, (N, N), flags=cv2.INTER_NEAREST, borderValue=0)
+                out = mw.copy().astype(np.uint8)
+                out[~square_mask] = 0
+                return out
+
+            h_use_sq = warp_h(h_use, float("nan"))
+            h_floor_sq = warp_h(h_floor, float("nan"))
+            h_ran_sq = warp_h(h_ransac, float("nan"))
+            h_use_m_sq = warp_m(h_use_valid.astype(np.uint8))
+            h_floor_m_sq = warp_m(h_floor_valid.astype(np.uint8))
+            h_ran_m_sq = warp_m(h_ransac_valid.astype(np.uint8))
+
+            N_sq = int(N)
+            if int(args.square_force_N) > 0 and int(args.square_force_N) != int(N_sq):
+                N_sq = int(args.square_force_N)
+                sem_sq = cv2.resize(sem_sq, (N_sq, N_sq), interpolation=cv2.INTER_NEAREST)
+                h_use_sq = resize_with_nan(h_use_sq, N_sq)
+                h_floor_sq = resize_with_nan(h_floor_sq, N_sq)
+                h_ran_sq = resize_with_nan(h_ran_sq, N_sq)
+                h_use_m_sq = cv2.resize(h_use_m_sq, (N_sq, N_sq), interpolation=cv2.INTER_NEAREST)
+                h_floor_m_sq = cv2.resize(h_floor_m_sq, (N_sq, N_sq), interpolation=cv2.INTER_NEAREST)
+                h_ran_m_sq = cv2.resize(h_ran_m_sq, (N_sq, N_sq), interpolation=cv2.INTER_NEAREST)
+
+            cell_m_sq = float(args.local_size_m) / float(N_sq)
+            objs_sq = extract_objects_from_grid(
+                sem_sq, h_use_sq, id_to_name, cell_m_sq,
+                max_objects=int(args.max_objects),
+                min_area_cells=int(args.min_area_cells),
+            )
+            cost_sq = default_cost_from_sem(sem_sq, id_to_name)
+
+            def pack_height_sq(h: np.ndarray):
+                m = np.isfinite(h)
+                v = np.where(m, h, 0.0).astype(np.float32)
+                return v, m.astype(np.uint8)
+
+            h_use_v_sq, h_use_m_sq = pack_height_sq(h_use_sq)
+            h_floor_v_sq, h_floor_m_sq = pack_height_sq(h_floor_sq)
+            h_ran_v_sq, h_ran_m_sq = pack_height_sq(h_ran_sq)
+
+            state_sq = {
+                **state,
+                "map": {
+                    **state["map"],
+                    "N": int(N_sq),
+                    "cell_m": float(cell_m_sq),
+                    "square_align": True,
+                },
+                "semantic_grid": sem_sq.tolist(),
+                "unknown_mask": (sem_sq == 0).astype(np.uint8).tolist(),
+                "height_rel_grid": h_use_v_sq.tolist(),
+                "height_valid_mask": h_use_m_sq.tolist(),
+                "height_rel_grid_floorref": h_floor_v_sq.tolist(),
+                "height_valid_mask_floorref": h_floor_m_sq.tolist(),
+                "height_rel_grid_ransac": h_ran_v_sq.tolist(),
+                "height_valid_mask_ransac": h_ran_m_sq.tolist(),
+                "objects": objs_sq,
+                "cost_grid_default": cost_sq.tolist(),
+                "stats": {
+                    **state["stats"],
+                    "unknown_ratio": float((sem_sq == 0).mean()),
+                    "valid_height_ratio": float(np.isfinite(h_use_sq).mean()),
+                    "valid_height_ratio_floorref": float(np.isfinite(h_floor_sq).mean()),
+                    "valid_height_ratio_ransac": float(np.isfinite(h_ran_sq).mean()),
+                    "valid_height_cells": int(np.isfinite(h_use_sq).sum()),
+                    "valid_height_cells_floorref": int(np.isfinite(h_floor_sq).sum()),
+                    "valid_height_cells_ransac": int(np.isfinite(h_ran_sq).sum()),
+                },
+                "square_meta": {
+                    "angle_deg": float(ang),
+                    "pad_cells": int(args.square_pad_cells),
+                    "fill_unknown_floor": bool(fill_unknown_floor),
+                    "force_N": int(N_sq),
+                }
+            }
+
+            sp_sq = os.path.join(out_states_square, f"state_{t}.json")
+            write_json(sp_sq, state_sq)
+            idx_sq_f.write(json.dumps({"t_ns": t, "state_path": sp_sq}, ensure_ascii=False) + "\n")
         processed += 1
 
     idx_f.close()
+    if idx_sq_f is not None:
+        idx_sq_f.close()
 
     np.save(os.path.join(out_global, "global_semantic.npy"), g_sem)
     gzt_save = g_ztop.copy()
@@ -661,7 +929,11 @@ def main():
         "processed_frames": processed,
         "global": {"GW": GW, "GH": GH, "res_m": res, "xmin": float(xmin), "ymin": float(ymin),
                    "xmax": float(xmax), "ymax": float(ymax)},
-        "dirs": {"states": out_states, "global_map": out_global},
+        "dirs": {
+            "states": out_states,
+            "global_map": out_global,
+            "states_square": out_states_square if out_states_square else None
+        },
     }
     write_json(os.path.join(args.out_dir, "summary.json"), summary)
     print("[Step7a-v4] done. processed_frames =", processed)

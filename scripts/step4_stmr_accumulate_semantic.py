@@ -58,6 +58,12 @@ def quat_wxyz_to_R(q):
     ], dtype=np.float64)
 
 
+def yaw_from_q_WB(q_wxyz):
+    R = quat_wxyz_to_R(q_wxyz)
+    fwd = R[:, 0]  # body x-axis in world
+    return float(math.atan2(fwd[1], fwd[0]))
+
+
 def make_T(R, t):
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
@@ -96,6 +102,40 @@ def compute_camera_yaw(T_W_B, T_C0orig_to_B, R_rect2orig):
     R_WC0rect = R_WB @ R_BC0orig @ R_orig2rect
     fwd = R_WC0rect @ np.array([0, 0, 1.0], dtype=np.float64)  # camera forward
     return float(math.atan2(fwd[1], fwd[0]))
+
+
+def filter_mask_by_depth(mask: np.ndarray,
+                         depth_valid: np.ndarray,
+                         min_label_pixels: int,
+                         min_label_depth_ratio: float,
+                         min_label_depth_pixels: int):
+    out = mask.copy()
+    stats = {
+        "labels_total": 0,
+        "labels_kept": 0,
+        "labels_dropped_small": 0,
+        "labels_dropped_depth": 0,
+    }
+    if min_label_pixels <= 0 and min_label_depth_ratio <= 0 and min_label_depth_pixels <= 0:
+        return out, stats
+    ids = [int(x) for x in np.unique(out) if int(x) > 0]
+    stats["labels_total"] = int(len(ids))
+    for cid in ids:
+        m = (out == cid)
+        pix = int(m.sum())
+        if min_label_pixels > 0 and pix < min_label_pixels:
+            out[m] = 0
+            stats["labels_dropped_small"] += 1
+            continue
+        ov = int((m & depth_valid).sum())
+        ratio = float(ov / max(pix, 1))
+        if (min_label_depth_pixels > 0 and ov < min_label_depth_pixels) or \
+           (min_label_depth_ratio > 0 and ratio < min_label_depth_ratio):
+            out[m] = 0
+            stats["labels_dropped_depth"] += 1
+        else:
+            stats["labels_kept"] += 1
+    return out, stats
 
 
 def maxpool_block(arr, oh, ow, mode="max"):
@@ -173,6 +213,10 @@ def main():
     ap.add_argument("--stmr_hw", type=int, nargs=2, default=[20, 20])
     ap.add_argument("--min_voxel_count", type=int, default=2)
     ap.add_argument("--min_depth_pts", type=int, default=300)
+    ap.add_argument("--min_depth_valid_ratio", type=float, default=0.01,
+                    help="skip frame if valid depth ratio is too low")
+    ap.add_argument("--yaw_source", type=str, default="body", choices=["body", "camera"],
+                    help="use body yaw or camera-forward yaw for local map orientation")
 
     # optional: prevent “full map” by keeping only recent voxels
     ap.add_argument("--keep_recent", type=int, default=0,
@@ -187,6 +231,14 @@ def main():
                     help="skip frame if overlap(mask, valid_depth)/mask_pixels < this (0 to disable)")
     ap.add_argument("--min_mask_pixels", type=int, default=200,
                     help="minimum mask pixels to enable overlap check")
+    ap.add_argument("--min_label_pixels", type=int, default=120,
+                    help="drop labels with too few pixels before depth filtering")
+    ap.add_argument("--min_label_depth_overlap", type=float, default=0.03,
+                    help="drop labels if depth overlap ratio is too low")
+    ap.add_argument("--min_label_depth_pixels", type=int, default=50,
+                    help="drop labels if depth-overlap pixels are too few")
+    ap.add_argument("--min_label_vote_ratio", type=float, default=0.55,
+                    help="min vote ratio for voxel label to be kept (0 to disable)")
 
     args = ap.parse_args()
 
@@ -290,12 +342,29 @@ def main():
         if (not args.mask_already_rectified) and (map0x is not None):
             mask = cv2.remap(mask, map0x, map0y, interpolation=cv2.INTER_NEAREST)
 
+        depth_valid_full = (depth > args.min_depth) & (depth < args.depth_trunc) & np.isfinite(depth)
+        depth_valid_ratio = float(depth_valid_full.mean())
+        if depth_valid_ratio < float(args.min_depth_valid_ratio):
+            append_jsonl(stats_path, {
+                "t_ns": t,
+                "depth_valid_ratio": depth_valid_ratio,
+                "skipped": "low_depth_valid_ratio"
+            })
+            continue
+
+        mask, mstats = filter_mask_by_depth(
+            mask,
+            depth_valid_full,
+            min_label_pixels=int(args.min_label_pixels),
+            min_label_depth_ratio=float(args.min_label_depth_overlap),
+            min_label_depth_pixels=int(args.min_label_depth_pixels),
+        )
+
         # mask-depth overlap sanity check
         if args.min_mask_depth_overlap > 0:
             mask_bin = (mask > 0)
             mask_pixels = int(mask_bin.sum())
             if mask_pixels >= int(args.min_mask_pixels):
-                depth_valid_full = (depth > args.min_depth) & (depth < args.depth_trunc) & np.isfinite(depth)
                 overlap = int((mask_bin & depth_valid_full).sum())
                 overlap_ratio = float(overlap / max(mask_pixels, 1))
                 if overlap_ratio < float(args.min_mask_depth_overlap):
@@ -304,6 +373,7 @@ def main():
                         "mask_pixels": mask_pixels,
                         "mask_depth_overlap": overlap,
                         "mask_depth_overlap_ratio": overlap_ratio,
+                        "label_filter": mstats,
                         "skipped": "low_mask_depth_overlap"
                     })
                     continue
@@ -318,6 +388,8 @@ def main():
                 "t_ns": t,
                 "depth_valid_pts": 0,
                 "mask_nonzero_ratio": float((mask > 0).mean()),
+                "depth_valid_ratio": depth_valid_ratio,
+                "label_filter": mstats,
                 "skipped": "no_valid_depth"
             })
             continue
@@ -333,6 +405,8 @@ def main():
                 "depth_valid_pts": int(Z_d.size),
                 "labeled_pts": int((lab_d > 0).sum()),
                 "mask_nonzero_ratio": float((mask > 0).mean()),
+                "depth_valid_ratio": depth_valid_ratio,
+                "label_filter": mstats,
                 "skipped": "too_few_depth_pts"
             })
             continue
@@ -368,6 +442,8 @@ def main():
                     "depth_valid_pts": int(P_W.shape[0]),
                     "labeled_pts": 0,
                     "mask_nonzero_ratio": float((mask > 0).mean()),
+                    "depth_valid_ratio": depth_valid_ratio,
+                    "label_filter": mstats,
                     "skipped": "all_unknown_labels"
                 })
                 continue
@@ -380,6 +456,8 @@ def main():
                 "depth_valid_pts": int(P_W.shape[0]),
                 "labeled_pts": int((lab_d > 0).sum()),
                 "mask_nonzero_ratio": float((mask > 0).mean()),
+                "depth_valid_ratio": depth_valid_ratio,
+                "label_filter": mstats,
                 "skipped": "too_few_after_zgate"
             })
             continue
@@ -411,7 +489,10 @@ def main():
                 g_hist.pop(k, None)
 
         # render local topdown
-        yaw = compute_camera_yaw(T_W_B, T_C0orig_to_B, R_rect2orig)
+        if args.yaw_source == "body":
+            yaw = yaw_from_q_WB(r["q_WB_wxyz"])
+        else:
+            yaw = compute_camera_yaw(T_W_B, T_C0orig_to_B, R_rect2orig)
         R_EW = rotz(-yaw)
 
         sem = np.zeros((grid_h, grid_w), dtype=np.uint8)
@@ -437,7 +518,16 @@ def main():
             ix = int((ve[0] + half_x) / args.res)
             iy = int((ve[1] + half_y) / args.res)
             if 0 <= ix < grid_w and 0 <= iy < grid_h:
-                label = argmax_label_hist(g_hist.get(k, {})) if (k in g_hist) else 0
+                hist = g_hist.get(k, {})
+                label = argmax_label_hist(hist) if hist else 0
+                if label > 0 and float(args.min_label_vote_ratio) > 0:
+                    total = int(sum(hist.values()))
+                    if total <= 0:
+                        label = 0
+                    else:
+                        ratio = float(hist.get(label, 0) / max(total, 1))
+                        if ratio < float(args.min_label_vote_ratio):
+                            label = 0
                 if ve[2] > ztop[iy, ix]:
                     ztop[iy, ix] = float(ve[2])
                     sem[iy, ix] = np.uint8(label)
@@ -450,6 +540,7 @@ def main():
             "t_ns": t,
             "center_world_xyz": [float(p[0]), float(p[1]), float(p[2])],
             "yaw_rad": float(yaw),
+            "yaw_source": str(args.yaw_source),
             "scale_m_per_cell": float(range_x / ow),
             "semantic_grid": sem20.astype(int).tolist(),
             "ztop_grid": ztop20.astype(float).tolist(),
@@ -475,6 +566,8 @@ def main():
             "depth_valid_pts": int(Z_d.size),
             "labeled_pts": int(labeled_cnt),
             "mask_nonzero_ratio": float((mask > 0).mean()),
+            "depth_valid_ratio": depth_valid_ratio,
+            "label_filter": mstats,
             "written": True
         })
 

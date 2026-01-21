@@ -275,6 +275,12 @@ def main():
     ap.add_argument("--text_thresh", type=float, default=0.25)
     ap.add_argument("--nms_iou", type=float, default=0.55)
     ap.add_argument("--max_dets", type=int, default=40)
+    ap.add_argument("--min_final_score", type=float, default=0.10,
+                    help="drop masks with final_score=dino_score*sam_score below this")
+    ap.add_argument("--min_box_area", type=float, default=200.0,
+                    help="drop detections with box area below this (px^2)")
+    ap.add_argument("--min_mask_area", type=int, default=80,
+                    help="drop masks with area below this (px)")
 
     # SAM2
     ap.add_argument("--sam2_repo_dir", required=True)
@@ -323,7 +329,12 @@ def main():
             "cfg_name": args.sam2_cfg_name,
             "cfg_abs": args.sam2_cfg_abs,
             "ckpt_abs": args.sam2_ckpt_abs,
-        }
+        },
+        "filter": {
+            "min_final_score": float(args.min_final_score),
+            "min_box_area": float(args.min_box_area),
+            "min_mask_area": int(args.min_mask_area),
+        },
     })
 
     print("[INFO] caption:", caption)
@@ -365,12 +376,16 @@ def main():
             if cid == 0:
                 continue
             box = clamp_box_xyxy([float(b[0]), float(b[1]), float(b[2]), float(b[3])], W, H)
+            box_area = max(0.0, (box[2] - box[0]) * (box[3] - box[1]))
+            if box_area < float(args.min_box_area):
+                continue
             dets.append({
                 "label_id": int(cid),
                 "label": id_to_class[int(cid)],
                 "phrase_raw": str(ph),
                 "score": float(sc),
                 "box_xyxy_px": box,
+                "box_area": float(box_area),
             })
 
         if len(dets) == 0:
@@ -399,9 +414,11 @@ def main():
             if m is None:
                 continue
             area = int(m.sum())
-            if area < 50:
+            if area < int(args.min_mask_area):
                 continue
             final_sc = float(d["score"]) * float(sam_sc)
+            if final_sc < float(args.min_final_score):
+                continue
             upd = m & (final_sc > conf)
             sem[upd] = np.uint8(d["label_id"])
             conf[upd] = np.float32(final_sc)

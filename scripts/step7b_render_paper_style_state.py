@@ -116,6 +116,76 @@ def rot90_semantic(sem: np.ndarray, k: int) -> np.ndarray:
         return sem
     return np.rot90(sem, k=k)
 
+def rot90_xy_pix(x: float, y: float, N: int, k: int) -> Tuple[float, float]:
+    k = int(k) % 4
+    if k == 0:
+        return x, y
+    if k == 1:
+        return (N - 1 - y), x
+    if k == 2:
+        return (N - 1 - x), (N - 1 - y)
+    return y, (N - 1 - x)
+
+def apply_affine_xy(M: np.ndarray, x: float, y: float) -> Tuple[float, float]:
+    return (M[0, 0] * x + M[0, 1] * y + M[0, 2],
+            M[1, 0] * x + M[1, 1] * y + M[1, 2])
+
+def compute_align_angle(sem: np.ndarray, min_known_cells: int) -> Optional[float]:
+    ys, xs = np.where(sem > 0)
+    if xs.size < min_known_cells:
+        return None
+    pts = np.stack([xs, ys], axis=1).astype(np.float32)
+    rect = cv2.minAreaRect(pts)
+    box = cv2.boxPoints(rect)
+    edges = box[np.arange(4)] - box[(np.arange(4) + 1) % 4]
+    lens = np.sum(edges * edges, axis=1)
+    i = int(np.argmax(lens))
+    dx, dy = edges[i]
+    ang = float(np.degrees(np.arctan2(dy, dx)))
+    return ang
+
+def crop_square_2d(arr: np.ndarray, x0: int, y0: int, side: int, fill_value):
+    out = np.full((side, side), fill_value, dtype=arr.dtype)
+    x1 = x0 + side
+    y1 = y0 + side
+    sx0 = max(0, x0)
+    sy0 = max(0, y0)
+    sx1 = min(arr.shape[1], x1)
+    sy1 = min(arr.shape[0], y1)
+    dx0 = sx0 - x0
+    dy0 = sy0 - y0
+    out[dy0:dy0 + (sy1 - sy0), dx0:dx0 + (sx1 - sx0)] = arr[sy0:sy1, sx0:sx1]
+    return out
+
+def align_and_crop_sem(sem: np.ndarray,
+                       min_known_cells: int,
+                       pad_cells: int,
+                       force_square: bool):
+    H, W = sem.shape
+    angle = compute_align_angle(sem, min_known_cells)
+    if angle is None:
+        M = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        return sem, M, 0, 0, W, 0.0
+    center = (W / 2.0, H / 2.0)
+    M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+    sem_rot = cv2.warpAffine(sem, M, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+    ys, xs = np.where(sem_rot > 0)
+    if xs.size == 0:
+        return sem_rot, M, 0, 0, W, angle
+    x0 = int(xs.min()) - int(pad_cells)
+    x1 = int(xs.max()) + 1 + int(pad_cells)
+    y0 = int(ys.min()) - int(pad_cells)
+    y1 = int(ys.max()) + 1 + int(pad_cells)
+    if force_square:
+        side = int(max(x1 - x0, y1 - y0))
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        x0 = int(np.floor(cx - side / 2.0))
+        y0 = int(np.floor(cy - side / 2.0))
+    side = int(max(x1 - x0, y1 - y0))
+    sem_crop = crop_square_2d(sem_rot, x0, y0, side, fill_value=0)
+    return sem_crop, M, x0, y0, side, angle
+
 def rot90_xy_meter(x: float, y: float, k: int) -> Tuple[float, float]:
     """
     对局部坐标 (x,y) 做 90deg*k 的逆时针旋转（用于显示对齐）
@@ -130,6 +200,57 @@ def rot90_xy_meter(x: float, y: float, k: int) -> Tuple[float, float]:
     return y, -x
 
 
+def resize_with_nan(h: np.ndarray, out_size: int) -> np.ndarray:
+    h = h.astype(np.float32)
+    valid = np.isfinite(h).astype(np.uint8)
+    h2 = h.copy()
+    h2[~np.isfinite(h2)] = 0.0
+    h_res = cv2.resize(h2, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+    m_res = cv2.resize(valid, (out_size, out_size), interpolation=cv2.INTER_NEAREST)
+    h_res[m_res == 0] = np.nan
+    return h_res
+
+
+def align_and_square_region(sem: np.ndarray,
+                            min_known_cells: int,
+                            pad_cells: int) -> Tuple[np.ndarray, np.ndarray, int, int, int, float]:
+    H, W = sem.shape
+    angle = compute_align_angle(sem, min_known_cells)
+    if angle is None:
+        M = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        return sem, M, 0, 0, W, 0.0
+    center = (W / 2.0, H / 2.0)
+    M = cv2.getRotationMatrix2D(center, -angle, 1.0)
+    sem_rot = cv2.warpAffine(sem, M, (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+    ys, xs = np.where(sem_rot > 0)
+    if xs.size == 0:
+        return sem_rot, M, 0, 0, W, angle
+    x0 = int(xs.min()) - int(pad_cells)
+    x1 = int(xs.max()) + 1 + int(pad_cells)
+    y0 = int(ys.min()) - int(pad_cells)
+    y1 = int(ys.max()) + 1 + int(pad_cells)
+    side = int(max(x1 - x0, y1 - y0))
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    x0 = int(np.floor(cx - side / 2.0))
+    y0 = int(np.floor(cy - side / 2.0))
+    return sem_rot, M, x0, y0, side, angle
+
+
+def square_mask_from_xy(sem_shape: Tuple[int, int], x0: int, y0: int, side: int) -> np.ndarray:
+    H, W = sem_shape
+    mask = np.zeros((H, W), dtype=bool)
+    x1 = x0 + side
+    y1 = y0 + side
+    sx0 = max(0, x0)
+    sy0 = max(0, y0)
+    sx1 = min(W, x1)
+    sy1 = min(H, y1)
+    if sx1 > sx0 and sy1 > sy0:
+        mask[sy0:sy1, sx0:sx1] = True
+    return mask
+
+
 # -------------------------
 # Height grid extraction from state
 # -------------------------
@@ -138,15 +259,17 @@ def get_height_grid_from_state(state: Dict[str, Any]) -> Tuple[Optional[np.ndarr
     尽可能从 state 里找高度网格与有效mask。
     兼容你前面提到的：state 里不一定有 ransac_stats / valid_height_ratio_ransac。
     """
-    # 常见候选键（按优先级）
-    candidates = [
-        ("height_rel_grid_ransac", "height_valid_mask_ransac"),
-        ("height_rel_grid_floorref", "height_valid_mask_floorref"),
-        ("height_rel_grid", "height_valid_mask"),
-        ("height_grid_m", "height_valid_mask"),
-        ("height_grid", "height_valid_mask"),
-    ]
-    for hk, mk in candidates:
+    # 优先用 state 记录的选择结果
+    select = state.get("height_select", {}) or {}
+    mode = select.get("mode_used", "") or (state.get("ground", {}) or {}).get("mode_used", "")
+    if isinstance(mode, str):
+        mode = mode.replace("_fallback", "")
+    mode_map = {
+        "ransac": ("height_rel_grid_ransac", "height_valid_mask_ransac"),
+        "floorref": ("height_rel_grid_floorref", "height_valid_mask_floorref"),
+    }
+    if mode in mode_map:
+        hk, mk = mode_map[mode]
         if hk in state and mk in state:
             try:
                 h = np.array(state[hk], dtype=np.float32)
@@ -154,6 +277,34 @@ def get_height_grid_from_state(state: Dict[str, Any]) -> Tuple[Optional[np.ndarr
                 return h, m
             except Exception:
                 pass
+
+    # 按有效率选择候选
+    candidates = [
+        ("height_rel_grid_ransac", "height_valid_mask_ransac", "valid_height_ratio_ransac"),
+        ("height_rel_grid_floorref", "height_valid_mask_floorref", "valid_height_ratio_floorref"),
+        ("height_rel_grid", "height_valid_mask", "valid_height_ratio"),
+        ("height_grid_m", "height_valid_mask", "valid_height_ratio"),
+        ("height_grid", "height_valid_mask", "valid_height_ratio"),
+    ]
+    stats = state.get("stats", {}) or {}
+    scored = []
+    for hk, mk, rk in candidates:
+        if hk in state and mk in state:
+            try:
+                m = np.array(state[mk], dtype=np.uint8)
+                ratio = float(stats.get(rk, float(m.mean())))
+                scored.append((ratio, hk, mk))
+            except Exception:
+                pass
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        _, hk, mk = scored[0]
+        try:
+            h = np.array(state[hk], dtype=np.float32)
+            m = np.array(state[mk], dtype=np.uint8)
+            return h, m
+        except Exception:
+            pass
 
     # 如果只有高度没有mask：用 finite & sem!=0
     for hk in ["height_rel_grid", "height_grid_m", "height_grid"]:
@@ -194,7 +345,14 @@ def draw_paper_style_state(ax_map, ax_mat, state: Dict[str, Any], id_to_name: Di
                           rot90_k: int = 0,
                           show_grid: bool = True,
                           show_height_in_matrix: bool = False,
-                          annotate_topk: int = 12):
+                          annotate_topk: int = 12,
+                          unknown_opaque: bool = False,
+                          align_known_square: bool = False,
+                          min_known_cells: int = 60,
+                          crop_pad_cells: int = 2,
+                          fill_unknown_floor: bool = False,
+                          floor_id: int = 0,
+                          force_size: int = 0):
     sem = np.array(state["semantic_grid"], dtype=np.uint8)
     N = int(sem.shape[0])
 
@@ -207,41 +365,96 @@ def draw_paper_style_state(ax_map, ax_mat, state: Dict[str, Any], id_to_name: Di
     # rotate by 90deg*k for display (both sem & later annotation coords)
     sem_show = rot90_semantic(sem, rot90_k)
 
-    base_rgb = render_semantic_rgb(sem_show)
+    square_mask = None
+    if align_known_square:
+        sem_rot, M_align, sx0, sy0, side, _ = align_and_square_region(
+            sem_show,
+            min_known_cells=int(min_known_cells),
+            pad_cells=int(crop_pad_cells),
+        )
+        square_mask = square_mask_from_xy(sem_rot.shape, sx0, sy0, side)
+        sem_show = np.zeros_like(sem_rot, dtype=np.uint8)
+        sem_show[square_mask] = sem_rot[square_mask]
+        crop_x0, crop_y0 = 0, 0
+        N_show = int(sem_show.shape[0])
+    else:
+        M_align = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        crop_x0, crop_y0 = 0, 0
+        N_show = int(sem_show.shape[0])
 
+    if fill_unknown_floor and int(floor_id) > 0 and square_mask is not None:
+        sem_show = sem_show.copy()
+        sem_show[square_mask] = int(floor_id)
+        keep = square_mask & (sem_rot > 0)
+        sem_show[keep] = sem_rot[keep]
+
+    left_m = (float(crop_x0) * cell_m) - half
+    right_m = (float(crop_x0 + N_show) * cell_m) - half
+    bottom_m = (float(crop_y0) * cell_m) - half
+    top_m = (float(crop_y0 + N_show) * cell_m) - half
+
+    h = hm = None
     if mode == "sem25d":
         h, hm = get_height_grid_from_state(state)
         if h is not None:
             h = rot90_semantic(h, rot90_k)
+            if align_known_square:
+                h = cv2.warpAffine(h, M_align, (N, N), flags=cv2.INTER_NEAREST, borderValue=np.nan)
+                if square_mask is not None:
+                    h2 = np.full_like(h, np.nan, dtype=np.float32)
+                    h2[square_mask] = h[square_mask]
+                    h = h2
         if hm is not None:
             hm = rot90_semantic(hm, rot90_k)
+            if align_known_square:
+                hm = cv2.warpAffine(hm, M_align, (N, N), flags=cv2.INTER_NEAREST, borderValue=0)
+                if square_mask is not None:
+                    hm2 = np.zeros_like(hm, dtype=np.uint8)
+                    hm2[square_mask] = hm[square_mask]
+                    hm = hm2
+
+    if int(force_size) > 0 and int(force_size) != int(N_show):
+        sem_show = cv2.resize(sem_show, (int(force_size), int(force_size)), interpolation=cv2.INTER_NEAREST)
+        if h is not None:
+            h = resize_with_nan(h, int(force_size))
+        if hm is not None:
+            hm = cv2.resize(hm.astype(np.uint8), (int(force_size), int(force_size)), interpolation=cv2.INTER_NEAREST)
+        N_show = int(force_size)
+
+    base_rgb = render_semantic_rgb(sem_show)
+
+    if mode == "sem25d":
         rgb_show = render_25d_rgb(sem_show, base_rgb, h, hm, hmax=hmax)
         title = f"Local 2.5D map (semantic color + height brightness, hmax={hmax:.1f}m)"
     else:
         rgb_show = base_rgb
         title = "Local semantic map"
 
+    cell_m_show = float((right_m - left_m) / max(N_show, 1))
+
     # left: top-down map (unknown transparent)
-    rgba = to_rgba(rgb_show, sem_show, unknown_transparent=True)
+    rgba = to_rgba(rgb_show, sem_show, unknown_transparent=(not unknown_opaque))
     ax_map.set_facecolor("white")
-    ax_map.imshow(rgba, origin="lower", extent=[-half, half, -half, half], interpolation="nearest")
+    ax_map.imshow(rgba, origin="lower", extent=[left_m, right_m, bottom_m, top_m], interpolation="nearest")
     ax_map.set_aspect("equal", adjustable="box")
-    ax_map.set_xlim(-half, half)
-    ax_map.set_ylim(-half, half)
+    ax_map.set_xlim(left_m, right_m)
+    ax_map.set_ylim(bottom_m, top_m)
     ax_map.set_xlabel("x (m)")
     ax_map.set_ylabel("y (m)")
     ax_map.set_title(title)
 
     # grid lines
     if show_grid:
-        for i in range(N + 1):
-            v = -half + i * cell_m
-            ax_map.plot([v, v], [-half, half], linewidth=0.3, color="black", alpha=0.15)
-            ax_map.plot([-half, half], [v, v], linewidth=0.3, color="black", alpha=0.15)
+        for i in range(N_show + 1):
+            vx = left_m + i * cell_m_show
+            vy = bottom_m + i * cell_m_show
+            ax_map.plot([vx, vx], [bottom_m, top_m], linewidth=0.3, color="black", alpha=0.15)
+            ax_map.plot([left_m, right_m], [vy, vy], linewidth=0.3, color="black", alpha=0.15)
 
     # ego position
-    ax_map.scatter([0], [0], marker="*", s=260, color="yellow",
-                   edgecolor="black", linewidth=1.0, zorder=5)
+    if (left_m <= 0.0 <= right_m) and (bottom_m <= 0.0 <= top_m):
+        ax_map.scatter([0], [0], marker="*", s=260, color="yellow",
+                       edgecolor="black", linewidth=1.0, zorder=5)
 
     # legend bottom-left
     handles = build_legend_handles(sem_show, id_to_name, max_items=14)
@@ -273,6 +486,12 @@ def draw_paper_style_state(ax_map, ax_mat, state: Dict[str, Any], id_to_name: Di
 
         # rotate display
         x, y = rot90_xy_meter(x, y, rot90_k)
+        if align_known_square:
+            px = (x + half) / cell_m
+            py = (y + half) / cell_m
+            px, py = apply_affine_xy(M_align, px, py)
+            x = left_m + (px + 0.5) * cell_m_show
+            y = bottom_m + (py + 0.5) * cell_m_show
 
         # text
         if h is None or (isinstance(h, str) and h.strip() == "?"):
@@ -296,18 +515,18 @@ def draw_paper_style_state(ax_map, ax_mat, state: Dict[str, Any], id_to_name: Di
     # unknown -> white for readability
     rgb_mat = rgb_show.copy()
     rgb_mat[sem_show == 0] = 255
-    ax_mat.imshow(rgb_mat, origin="lower", extent=[0, N, 0, N], interpolation="nearest")
-    for i in range(N + 1):
-        ax_mat.plot([i, i], [0, N], color="black", linewidth=0.3, alpha=0.6)
-        ax_mat.plot([0, N], [i, i], color="black", linewidth=0.3, alpha=0.6)
+    ax_mat.imshow(rgb_mat, origin="lower", extent=[0, N_show, 0, N_show], interpolation="nearest")
+    for i in range(N_show + 1):
+        ax_mat.plot([i, i], [0, N_show], color="black", linewidth=0.3, alpha=0.6)
+        ax_mat.plot([0, N_show], [i, i], color="black", linewidth=0.3, alpha=0.6)
 
     # optional text per cell
     if show_height_in_matrix and mode == "sem25d":
         h, hm = get_height_grid_from_state(state)
         if h is not None:
             h = rot90_semantic(h, rot90_k)
-        for yy in range(N):
-            for xx in range(N):
+        for yy in range(N_show):
+            for xx in range(N_show):
                 cid = int(sem_show[yy, xx])
                 if cid == 0:
                     continue
@@ -318,18 +537,18 @@ def draw_paper_style_state(ax_map, ax_mat, state: Dict[str, Any], id_to_name: Di
                     ax_mat.text(xx + 0.5, yy + 0.5, f"{cid}",
                                 ha="center", va="center", fontsize=4, color="black")
     else:
-        for yy in range(N):
-            for xx in range(N):
+        for yy in range(N_show):
+            for xx in range(N_show):
                 cid = int(sem_show[yy, xx])
                 if cid == 0:
                     continue
                 ax_mat.text(xx + 0.5, yy + 0.5, f"{cid}",
                             ha="center", va="center", fontsize=4, color="black")
 
-    ax_mat.scatter([N / 2], [N / 2], marker="*", s=260, color="yellow",
+    ax_mat.scatter([N_show / 2], [N_show / 2], marker="*", s=260, color="yellow",
                    edgecolor="black", linewidth=1.0)
-    ax_mat.set_xlim(0, N)
-    ax_mat.set_ylim(0, N)
+    ax_mat.set_xlim(0, N_show)
+    ax_mat.set_ylim(0, N_show)
     ax_mat.set_xticks([])
     ax_mat.set_yticks([])
     ax_mat.set_title("Matrix (NxN)")
@@ -337,7 +556,7 @@ def draw_paper_style_state(ax_map, ax_mat, state: Dict[str, Any], id_to_name: Di
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--states_dir", required=True, help="directory containing state_*.json")
+    ap.add_argument("--states_dir", default="", help="directory containing state_*.json (default: states_square if exists)")
     ap.add_argument("--labels_json", required=True, help="labels.json with class_to_id mapping")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--t_ns", default="", help="which state to render; empty -> latest")
@@ -349,6 +568,16 @@ def main():
     ap.add_argument("--save_25d", action="store_true")
     ap.add_argument("--hmax_25d", type=float, default=2.5)
     ap.add_argument("--show_height_in_matrix", action="store_true")
+    ap.add_argument("--unknown_opaque", action="store_true",
+                    help="render unknown as opaque (avoid tilted visible area)")
+    ap.add_argument("--no_align_known_square", action="store_true",
+                    help="disable alignment and square masking")
+    ap.add_argument("--min_known_cells", type=int, default=60)
+    ap.add_argument("--crop_pad_cells", type=int, default=2)
+    ap.add_argument("--no_fill_unknown_floor", action="store_true",
+                    help="do not convert unknown to floor in render")
+    ap.add_argument("--force_size", type=int, default=0,
+                    help="force rendered grid size (0 to disable)")
 
     args = ap.parse_args()
     ensure_dir(args.out_dir)
@@ -357,11 +586,23 @@ def main():
     class_to_id = labels.get("class_to_id", {})
     id_to_name = {int(v): k for k, v in class_to_id.items()}
     id_to_name[0] = "unknown"
+    floor_id = int(class_to_id.get("floor", 0))
 
-    state_path = find_state_file(args.states_dir, args.t_ns)
+    states_dir = args.states_dir
+    if not states_dir:
+        cand = os.path.join(os.path.dirname(args.out_dir), "states_square")
+        if os.path.isdir(cand):
+            states_dir = cand
+    if not states_dir:
+        raise ValueError("states_dir is required if states_square does not exist")
+
+    state_path = find_state_file(states_dir, args.t_ns)
     state = read_json(state_path)
     t = state.get("t_ns", "")
     print("[load]", state_path)
+    align_known_square = (not bool(args.no_align_known_square))
+    fill_unknown_floor = (not bool(args.no_fill_unknown_floor))
+    force_size = int(args.force_size)
 
     # semantic figure
     fig = plt.figure(figsize=(14, 6))
@@ -374,6 +615,13 @@ def main():
         show_grid=args.show_grid,
         show_height_in_matrix=args.show_height_in_matrix,
         annotate_topk=args.annotate_topk,
+        unknown_opaque=bool(args.unknown_opaque),
+        align_known_square=align_known_square,
+        min_known_cells=int(args.min_known_cells),
+        crop_pad_cells=int(args.crop_pad_cells),
+        fill_unknown_floor=fill_unknown_floor,
+        floor_id=int(floor_id),
+        force_size=force_size,
     )
     plt.tight_layout()
     out1 = os.path.join(args.out_dir, f"paper_style_state_t{t}.png")
@@ -394,6 +642,13 @@ def main():
             show_grid=args.show_grid,
             show_height_in_matrix=True,
             annotate_topk=args.annotate_topk,
+            unknown_opaque=bool(args.unknown_opaque),
+            align_known_square=align_known_square,
+            min_known_cells=int(args.min_known_cells),
+            crop_pad_cells=int(args.crop_pad_cells),
+            fill_unknown_floor=fill_unknown_floor,
+            floor_id=int(floor_id),
+            force_size=force_size,
         )
         plt.tight_layout()
         out2 = os.path.join(args.out_dir, f"paper_style_state25d_t{t}.png")
